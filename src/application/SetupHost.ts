@@ -5,7 +5,11 @@ import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
 import { ConfigurationError } from "../domain/configurationErrors.js";
 import { PRODUCT_IDENTITY } from "../identity.js";
-import { npxRegistrationCommand } from "./ClientRegistrationIdentity.js";
+import {
+  invokingPackageRunner,
+  packageRunnerRegistrationCommand,
+  type PackageRunner,
+} from "./ClientRegistrationIdentity.js";
 import {
   SUPPORTED_NODE_VERSION_PROSE,
   supportsNodeVersion,
@@ -48,10 +52,10 @@ import type { DoctorScope } from "./Doctor.js";
 /** Resolve the executable and arguments used in a managed MCP registration. */
 export const setupRegistrationCommand = (
   platform: NodeJS.Platform,
-  useNpmRunner: boolean,
+  packageRunner: PackageRunner | undefined,
 ): readonly string[] =>
-  useNpmRunner
-    ? npxRegistrationCommand(platform)
+  packageRunner !== undefined
+    ? packageRunnerRegistrationCommand(packageRunner, platform)
     : platform === "win32"
       ? [
           process.execPath,
@@ -90,7 +94,7 @@ export const hostRemediation = async (
       : undefined;
   }
   if ((await host.linuxDistribution())?.supported === true) return undefined;
-  return "Automated Hopper setup supports Ubuntu 24.04+, Fedora 41+, Nobara 44+, 64-bit Arch Linux, and CachyOS; configure an existing supported provider instead.";
+  return "Automated Hopper setup supports Ubuntu 24.04+, Fedora 41+, Nobara 44+, 64-bit Arch Linux, CachyOS, and Omarchy; configure an existing supported provider instead.";
 };
 
 /** Production setup effects for Hopper, agent configuration, and the canonical skill directory. */
@@ -113,7 +117,7 @@ export const systemSetupHost = (
       skillDestinations(homeDirectory, clientIds, environment, platform),
     registrationCommand: setupRegistrationCommand(
       platform,
-      environment.npm_command === "exec",
+      invokingPackageRunner(environment, platform),
     ),
     nodeVersion: process.versions.node,
     macosVersion: () => doctorHost.macosVersion(),

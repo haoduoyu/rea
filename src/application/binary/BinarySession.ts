@@ -6,7 +6,7 @@ import {
   type AnalysisProfileCommitment,
 } from "../../domain/analysisProfile.js";
 import { AnalysisCancelledError } from "../../domain/analysisErrorCore.js";
-import { type AnalysisError } from "../../domain/analysisErrorBase.js";
+import type { AnalysisError } from "../../domain/analysisErrorBase.js";
 import { err, ok, type Result } from "../../domain/result.js";
 import type { JsonValue } from "../../domain/jsonValue.js";
 import { createEvidence } from "../../domain/evidence.js";
@@ -96,6 +96,30 @@ export class BinarySession
   ) {
     super(records);
     this.#providerRouter = providerRouter;
+  }
+
+  /**
+   * Fast-path liveness gate (#1719): short-circuit only when the retained
+   * client is genuinely alive. The probe reads the child's operation health
+   * rather than the composite's unconditionally-ok `health`, so a dead child
+   * falls through and a real client is started; an aborted caller leaves the
+   * session untouched. Returns the fast-path result, or undefined to fall
+   * through to the slow path.
+   */
+  async #tryRetainedFastPath(
+    retained: SessionBinding,
+    target: BinaryTarget,
+    options: Pick<BinarySessionOpenOptions, "signal" | "snapshot">,
+  ): Promise<Result<BinaryTarget, AnalysisError> | undefined> {
+    const live = await this.#retainedClientLive(retained.client, options);
+    if (isAborted(options.signal))
+      return err(new AnalysisCancelledError("open_binary"));
+    if (!live) return undefined;
+    if (options.snapshot !== undefined) {
+      const imported = this.importAnalysisSnapshot(options.snapshot);
+      if (!imported.ok) return imported;
+    }
+    return ok(target);
   }
 
   /** Identify the provider producing evidence for this session. */
@@ -247,12 +271,14 @@ export class BinarySession
       if (!pendingClosed.ok) return pendingClosed;
       if (isAborted(options.signal))
         return err(new AnalysisCancelledError("open_binary"));
-      if (sameTarget && sameProfile) {
-        if (options.snapshot !== undefined) {
-          const imported = this.importAnalysisSnapshot(options.snapshot);
-          if (!imported.ok) return imported;
-        }
-        return ok(target);
+      const retained = sameTarget && sameProfile ? this.#active : undefined;
+      if (retained !== undefined) {
+        const fastPath = await this.#tryRetainedFastPath(
+          retained,
+          target,
+          options,
+        );
+        if (fastPath !== undefined) return fastPath;
       }
       const previous = this.#active;
       this.#active = undefined;
@@ -497,7 +523,7 @@ export class BinarySession
   execute(
     name: Parameters<AnalysisOperationPort["execute"]>[0],
     arguments_: Readonly<Record<string, JsonValue>>,
-    options?: { readonly signal?: AbortSignal },
+    options?: Pick<ExecutionOptions, "signal" | "selectorOrigin">,
   ): Promise<Result<AnalysisExecution, AnalysisError>> {
     const generation = this.#transitionGeneration;
     const call = this.#execute(name, arguments_, options, this.#transition);
@@ -535,7 +561,7 @@ export class BinarySession
   async #execute(
     name: Parameters<AnalysisOperationPort["execute"]>[0],
     arguments_: Readonly<Record<string, JsonValue>>,
-    options: { readonly signal?: AbortSignal } | undefined,
+    options: Pick<ExecutionOptions, "signal" | "selectorOrigin"> | undefined,
     transition: Promise<void>,
   ): Promise<Result<AnalysisExecution, AnalysisError>> {
     const transitioned = await this.#waitForTransition(
@@ -701,6 +727,36 @@ export class BinarySession
         .filter(([, generation]) => generation <= admittedThrough)
         .map(([call]) => call),
     );
+  }
+
+  /**
+   * Probe whether a retained provider client is still live.
+   *
+   * On production routes the client is a CompositeProvider whose `health`
+   * answers unconditionally ok without touching a child, so `health` alone
+   * cannot see a dead child. `operationHealthSnapshot` reaches the
+   * instantiated children instead. Only the known-live states allow the
+   * fast path: `exited`/`unreachable` are dead, `unknown` is never
+   * evidence of health (it is what a recorded but uncharacterized failure
+   * reports), and `not_started` is a startup that never completed — in the
+   * Hopper timeout case the client holds retained resources that block the
+   * next `start()` until `close()` retries cleanup, so treating it as live
+   * would skip the retire path and hand the wedged client to subsequent
+   * analysis. The gate fails closed: without a snapshot signal, fall back
+   * to the `health` admission probe.
+   */
+  async #retainedClientLive(
+    client: AnalysisClient,
+    options: Pick<BinarySessionOpenOptions, "signal">,
+  ): Promise<boolean> {
+    const snapshot = client.operationHealthSnapshot?.();
+    if (snapshot !== undefined)
+      return snapshot.state === "idle" || snapshot.state === "busy";
+    try {
+      return (await client.execute("health", {}, options)).ok;
+    } catch {
+      return false;
+    }
   }
 
   async #restore(
